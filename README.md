@@ -1,12 +1,15 @@
-# Umbrella Sampling Pipeline v2 — GROMACS
+# Umbrella Sampling Pipeline v3 — GROMACS
 
 Automatización completa de umbrella sampling para calcular el **Potential of Mean Force (PMF)** y la energía libre de disociación (**ΔG**).
 
 
-## 🆕 Mejoras v2
+## 🆕 Mejoras v3
 
 | Feature | Descripción |
 |---------|-------------|
+| **Scripts modulares** | Lógica Python extraída a `scripts/` (depurable, reutilizable) |
+| **Validación de overlap** | Integral cuantitativo de solapamiento entre ventanas |
+| **Limpieza automática** | `--cleanup` con 3 niveles (comprimir, eliminar, profunda) |
 | **3 modos** | Multi-cadena, proteína-ligando, permeación de membrana |
 | **Carpetas organizadas** | `proteins/`, `ligands/`, `membranes/` con subcarpetas por proyecto |
 | **Auto-caja** | Calcula automáticamente centro y dimensiones |
@@ -29,9 +32,16 @@ Automatización completa de umbrella sampling para calcular el **Potential of Me
 ```
 umbrella_sampling/
 │
-├── umbrella_pipeline.sh          # Script principal (15 etapas)
+├── umbrella_pipeline.sh          # Script principal (17 etapas)
 ├── plot_umbrella.py              # 7 tipos de gráficos
 ├── README.md
+│
+├── scripts/                      # ← Scripts Python modulares (NUEVO v3)
+│   ├── jarzynski.py              #   Estimación W = ∫F·dx
+│   ├── select_windows.py         #   Selección adaptativa de ventanas
+│   ├── analyze_convergence.py    #   Block averaging por ventana
+│   ├── detect_gaps.py            #   Detección de gaps en histogramas
+│   └── validate_overlap.py       #   ∫min(P_i, P_j)dξ entre ventanas
 │
 ├── mdp/                          # Archivos MDP (requeridos)
 │   ├── ions.mdp
@@ -69,6 +79,7 @@ umbrella_sampling/
         ├── 00_setup/ ... 06_umbrella_prod/
         ├── 07_analysis/
         │   ├── pmf.xvg, histogram.xvg
+        │   ├── overlap_report.dat    # NUEVO v3
         │   ├── convergence_report.dat
         │   ├── jarzynski.dat
         │   └── plots/           # 7 gráficos PNG
@@ -141,10 +152,37 @@ chmod +x umbrella_pipeline.sh
 # Reanuda etapas completas Y ventanas individuales desde .cpt
 ```
 
+### Limpiar archivos temporales
+
+```bash
+./umbrella_pipeline.sh --cleanup US_RUN/<nombre>/
+# 3 niveles:
+#   1) Comprimir frames → frames_backup.tar.gz
+#   2) Eliminar frames y temporales
+#   3) Limpieza profunda (+ comprimir logs, eliminar .xtc)
+```
+
 ### Graficar
 
 ```bash
 python3 plot_umbrella.py US_RUN/<nombre>/07_analysis/
+```
+
+### Ejecutar scripts individuales
+
+Los scripts de `scripts/` se pueden ejecutar de forma independiente:
+```bash
+# Validar overlap de histogramas
+python3 scripts/validate_overlap.py US_RUN/<nombre>/07_analysis/histogram.xvg US_RUN/<nombre>/07_analysis/
+
+# Analizar convergencia
+python3 scripts/analyze_convergence.py US_RUN/<nombre>/06_umbrella_prod/ US_RUN/<nombre>/07_analysis/ kCal
+
+# Detectar gaps
+python3 scripts/detect_gaps.py histogram.xvg 0.2 summary_distances.dat gap_windows.dat
+
+# Jarzynski
+python3 scripts/jarzynski.py pullf.xvg pullx.xvg output_dir/ kCal
 ```
 
 ## Modos del sistema
@@ -155,7 +193,7 @@ python3 plot_umbrella.py US_RUN/<nombre>/07_analysis/
 | **protlig** | Ligando | Proteína | Unbinding |
 | **membrane** | Permeant | Membrana | Permeación |
 
-## Etapas del pipeline (15)
+## Etapas del pipeline (17)
 
 | # | Etapa | Descripción |
 |---|-------|-------------|
@@ -169,12 +207,23 @@ python3 plot_umbrella.py US_RUN/<nombre>/07_analysis/
 | 8 | Pulling SMD | Steered MD |
 | 8b | PBC correction | nojump + center |
 | 9 | Frames + distancias | Extraer + COM dist |
-| 9b | Jarzynski | W = ∫F·dx |
-| 10 | Ventanas adaptativas | Greedy por distancia |
+| 9b | Jarzynski | W = ∫F·dx → `scripts/jarzynski.py` |
+| 10 | Ventanas adaptativas | Greedy por distancia → `scripts/select_windows.py` |
 | 11-12 | Umbrella NPT + prod | Checkpoint granular |
 | 13 | WHAM | PMF + bootstrap |
-| 14 | Convergencia | Block averaging |
-| 15 | Gap detection | Auto-fill + re-WHAM |
+| 14 | Convergencia | Block averaging → `scripts/analyze_convergence.py` |
+| 15 | Gap detection | Auto-fill + re-WHAM → `scripts/detect_gaps.py` |
+| 15b | **Overlap validation** | ∫min(P_i,P_j)dξ → `scripts/validate_overlap.py` |
+
+## Scripts modulares (`scripts/`)
+
+| Script | Función | Argumentos CLI |
+|--------|---------|----------------|
+| `jarzynski.py` | Estimación Jarzynski ΔG | `<pullf.xvg> <pullx.xvg> <outdir> <unit>` |
+| `select_windows.py` | Selección adaptativa | `<spacing> <distances.dat> <output>` |
+| `analyze_convergence.py` | Block averaging | `<prod_dir> <out_dir> <unit>` |
+| `detect_gaps.py` | Detección de gaps | `<histogram.xvg> <spacing> <dist.dat> <gap_out>` |
+| `validate_overlap.py` | Solapamiento cuantitativo | `<histogram.xvg> <out_dir>` |
 
 ## Gráficos generados (7)
 
@@ -194,7 +243,10 @@ python3 plot_umbrella.py US_RUN/<nombre>/07_analysis/
 |-------|----------|
 | No encuentra PDBs | Crea `proteins/<nombre>/tu_proteina.pdb` |
 | Ligando no encontrado | Parametrizar → copiar `.itp` + `.gro` a `ligands/<nombre>/` |
+| `scripts/` no encontrada | Asegúrate de que `scripts/` está junto a `umbrella_pipeline.sh` |
 | Histogramas sin overlap | Reducir `WINDOW_SPACING` o aumentar `PULL_K` |
+| Overlap CRÍTICO (<1%) | Agregar ventanas intermedias en esa región |
 | WHAM no converge | Más tiempo de producción |
 | Ventanas `CHECK` | Extender esas ventanas |
 | Ventana interrumpida | `--resume` detecta `.cpt` y continúa |
+| Disco lleno | `--cleanup` para comprimir/eliminar temporales |

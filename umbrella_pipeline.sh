@@ -39,6 +39,7 @@ fi
 
 readonly BASE_MDP=mdp
 readonly INITIAL_DIR="$(pwd)"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts"
 WORKDIR="US_RUN"
 
 # Modo del sistema (se define en get_user_input)
@@ -98,11 +99,12 @@ trap cleanup_on_error EXIT
 #==========================================
 show_help() {
     cat <<EOF
-${BLUE}  UMBRELLA SAMPLING PIPELINE v2 — GROMACS${NC}
+${BLUE}  UMBRELLA SAMPLING PIPELINE v3 — GROMACS${NC}
 
 ${CYAN}Uso:${NC}
   $0                    Ejecución interactiva
   $0 --resume <DIR>     Reanudar
+  $0 --cleanup <DIR>    Limpiar archivos temporales
   $0 --help             Ayuda
 
 ${CYAN}Modos:${NC}
@@ -110,13 +112,16 @@ ${CYAN}Modos:${NC}
   2) Proteína-Ligando — Extraer ligando del sitio activo
   3) Permeación      — Molécula a través de membrana lipídica
 
-${CYAN}Features v2:${NC}
+${CYAN}Features v3:${NC}
+  • Scripts Python modulares (scripts/)
   • Selección adaptativa de ventanas por distancia
   • Detección de gaps en histogramas + auto-fill
+  • Validación cuantitativa de overlap entre ventanas
   • Convergencia por ventana (block averaging)
   • Estimación Jarzynski ΔG desde SMD
   • Corrección automática de PBC
   • Auto-detección de dimensiones de caja
+  • Limpieza automática de temporales (--cleanup)
 EOF
     exit 0
 }
@@ -797,65 +802,7 @@ estimate_jarzynski() {
         mark_stage_done "$STAGE"; return
     fi
 
-    # Calcular trabajo W = ∫ F·dx usando trapezoidal
-    # Extraer fuerza y posición, calcular W
-    python3 - "$pullf" "$pullx" "$RUNDIR/07_analysis" "$PMF_UNIT" <<'PYEOF'
-import sys, os
-import numpy as np
-
-def parse_xvg(f):
-    data = []
-    with open(f) as fh:
-        for line in fh:
-            if line.startswith(('#','@')): continue
-            vals = line.split()
-            if len(vals) >= 2:
-                data.append([float(v) for v in vals[:2]])
-    return np.array(data) if data else None
-
-pullf_file, pullx_file, outdir, unit = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-os.makedirs(outdir, exist_ok=True)
-
-force_data = parse_xvg(pullf_file)
-pos_data = parse_xvg(pullx_file)
-
-if force_data is None or pos_data is None:
-    print("  ⚠ Datos insuficientes para Jarzynski"); sys.exit(0)
-
-# Interpolar a mismos tiempos
-n = min(len(force_data), len(pos_data))
-force = force_data[:n, 1]  # kJ/mol/nm
-pos = pos_data[:n, 1]      # nm
-
-# Trabajo acumulado: W = sum(F * dx)
-dx = np.diff(pos)
-f_avg = (force[:-1] + force[1:]) / 2.0
-work_incremental = f_avg * dx
-work_cumulative = np.cumsum(work_incremental)
-
-# ΔG Jarzynski (single trajectory, 2nd order cumulant approximation)
-# Para una sola trayectoria: ΔG ≈ W (primera orden)
-total_work = work_cumulative[-1] if len(work_cumulative) > 0 else 0
-
-factor = 1.0 / 4.184 if 'kCal' in unit else 1.0
-total_work_conv = total_work * factor
-
-with open(os.path.join(outdir, 'jarzynski.dat'), 'w') as out:
-    out.write(f"# Jarzynski estimate from SMD\n")
-    out.write(f"# W_total = {total_work:.2f} kJ/mol = {total_work/4.184:.2f} kCal/mol\n")
-    out.write(f"# NOTE: Single trajectory — overestimates |ΔG| (upper bound)\n")
-    out.write(f"W_kJ {total_work:.4f}\n")
-    out.write(f"W_kCal {total_work/4.184:.4f}\n")
-
-# Guardar perfil de trabajo acumulado
-with open(os.path.join(outdir, 'jarzynski_work.xvg'), 'w') as out:
-    out.write("# Cumulative work from SMD\n")
-    out.write("# Position(nm)  Work(kJ/mol)\n")
-    for i in range(len(work_cumulative)):
-        out.write(f"{pos[i+1]:.4f} {work_cumulative[i]:.4f}\n")
-
-print(f"  ✓ Jarzynski W ≈ {total_work_conv:.1f} {unit}/mol (upper bound)")
-PYEOF
+    python3 "$SCRIPT_DIR/jarzynski.py" "$pullf" "$pullx" "$RUNDIR/07_analysis" "$PMF_UNIT"
 
     log_success "Estimación Jarzynski guardada en 07_analysis/"
     mark_stage_done "$STAGE"
@@ -870,46 +817,10 @@ select_windows() {
     log_step "Etapa 10: Selección adaptativa de ventanas"
     cd "$RUNDIR/04_frames" || exit 1
 
-    # SELECCIÓN ADAPTATIVA: elegir frames cuyas distancias estén
-    # uniformemente espaciadas cada WINDOW_SPACING nm
     log_info "Selección adaptativa (espaciado ≈ $WINDOW_SPACING nm)..."
 
-    python3 - "$WINDOW_SPACING" summary_distances.dat "$RUNDIR/selected_windows.dat" <<'PYEOF'
-import sys
-import numpy as np
-
-spacing = float(sys.argv[1])
-dist_file = sys.argv[2]
-out_file = sys.argv[3]
-
-# Leer distancias
-data = np.loadtxt(dist_file)
-frames = data[:, 0].astype(int)
-distances = data[:, 1]
-
-# Ordenar por distancia
-idx_sorted = np.argsort(distances)
-frames_sorted = frames[idx_sorted]
-dist_sorted = distances[idx_sorted]
-
-# Seleccionar ventanas: greedy, cada ~spacing nm
-selected = [(frames_sorted[0], dist_sorted[0])]
-last_d = dist_sorted[0]
-
-for i in range(1, len(dist_sorted)):
-    if abs(dist_sorted[i] - last_d) >= spacing * 0.9:  # 90% del spacing
-        selected.append((frames_sorted[i], dist_sorted[i]))
-        last_d = dist_sorted[i]
-
-# Escribir
-with open(out_file, 'w') as f:
-    f.write("# window frame distance\n")
-    for w, (fr, d) in enumerate(selected):
-        f.write(f"{w} {fr} {d:.4f}\n")
-
-print(f"WINDOWS={len(selected)}")
-print(f"RANGE={selected[0][1]:.3f}-{selected[-1][1]:.3f}")
-PYEOF
+    python3 "$SCRIPT_DIR/select_windows.py" "$WINDOW_SPACING" \
+        summary_distances.dat "$RUNDIR/selected_windows.dat"
 
     # Leer resultados
     NUM_WINDOWS=$(grep -c '^[0-9]' "$RUNDIR/selected_windows.dat" || echo 0)
@@ -1113,72 +1024,8 @@ analyze_convergence() {
     log_step "Etapa 14: Análisis de convergencia (block averaging)"
     cd "$RUNDIR/07_analysis" || exit 1
 
-    python3 - "$RUNDIR/06_umbrella_prod" "$RUNDIR/07_analysis" "$PMF_UNIT" <<'PYEOF'
-import sys, os, glob
-import numpy as np
-
-prod_dir = sys.argv[1]
-out_dir = sys.argv[2]
-unit = sys.argv[3]
-
-def parse_xvg(f):
-    data = []
-    with open(f) as fh:
-        for line in fh:
-            if line.startswith(('#','@')): continue
-            v = line.split()
-            if len(v) >= 2:
-                data.append([float(x) for x in v[:2]])
-    return np.array(data) if data else None
-
-# Analizar cada ventana — calcular media y varianza en bloques
-pullx_files = sorted(glob.glob(os.path.join(prod_dir, 'umbrella*_pullx.xvg')))
-
-results = []
-for pf in pullx_files:
-    data = parse_xvg(pf)
-    if data is None or len(data) < 100: continue
-    pos = data[:, 1]
-    n = len(pos)
-    w_name = os.path.basename(pf).replace('_pullx.xvg','')
-
-    # Block averaging: dividir en 5 bloques
-    n_blocks = 5
-    block_size = n // n_blocks
-    block_means = []
-    for b in range(n_blocks):
-        block = pos[b*block_size:(b+1)*block_size]
-        block_means.append(np.mean(block))
-
-    overall_mean = np.mean(pos)
-    overall_std = np.std(pos)
-    block_std = np.std(block_means)
-    # SEM from block averaging
-    sem = block_std / np.sqrt(n_blocks)
-
-    # Drift: diferencia entre primer y último bloque
-    drift = abs(block_means[-1] - block_means[0])
-
-    converged = "YES" if (drift < 0.05 and sem < 0.02) else "CHECK"
-    results.append((w_name, overall_mean, overall_std, sem, drift, converged))
-
-# Escribir reporte
-out_file = os.path.join(out_dir, 'convergence_report.dat')
-with open(out_file, 'w') as f:
-    f.write("# Window  Mean(nm)  Std(nm)  SEM(nm)  Drift(nm)  Status\n")
-    bad = 0
-    for r in results:
-        f.write(f"{r[0]:20s} {r[1]:8.4f} {r[2]:8.4f} {r[3]:8.4f} {r[4]:8.4f} {r[5]}\n")
-        if r[5] == "CHECK": bad += 1
-
-    f.write(f"\n# Total windows: {len(results)}\n")
-    f.write(f"# Converged: {len(results)-bad}\n")
-    f.write(f"# Need review: {bad}\n")
-
-print(f"  ✓ Convergencia: {len(results)-bad}/{len(results)} ventanas convergen")
-if bad > 0:
-    print(f"  ⚠ {bad} ventanas necesitan más sampling (ver convergence_report.dat)")
-PYEOF
+    python3 "$SCRIPT_DIR/analyze_convergence.py" \
+        "$RUNDIR/06_umbrella_prod" "$RUNDIR/07_analysis" "$PMF_UNIT"
 
     log_success "Reporte en: convergence_report.dat"
     mark_stage_done "$STAGE"
@@ -1195,78 +1042,8 @@ detect_histogram_gaps() {
 
     [ ! -f histogram.xvg ] && { log_warning "histogram.xvg no encontrado"; mark_stage_done "$STAGE"; return; }
 
-    python3 - histogram.xvg "$WINDOW_SPACING" "$RUNDIR/04_frames/summary_distances.dat" \
-        "$RUNDIR/gap_windows.dat" <<'PYEOF'
-import sys
-import numpy as np
-
-hist_file = sys.argv[1]
-spacing = float(sys.argv[2])
-dist_file = sys.argv[3]
-gap_file = sys.argv[4]
-
-# Parse histogram
-data = []
-with open(hist_file) as f:
-    for line in f:
-        if line.startswith(('#','@')): continue
-        vals = line.split()
-        if vals:
-            data.append([float(v) for v in vals])
-if not data:
-    print("  ⚠ Histograma vacío"); sys.exit(0)
-
-data = np.array(data)
-xi = data[:, 0]
-hists = data[:, 1:]
-n_windows = hists.shape[1]
-
-# Detectar gaps: regiones de xi donde ningún histograma tiene conteo significativo
-max_per_window = np.max(hists, axis=0)
-threshold = np.mean(max_per_window) * 0.01  # 1% del máximo promedio
-
-# Para cada punto xi, verificar overlap
-total_count = np.sum(hists, axis=1)
-gap_regions = xi[total_count < threshold]
-
-if len(gap_regions) == 0:
-    print("  ✓ No se detectaron gaps en los histogramas")
-    with open(gap_file, 'w') as f:
-        f.write("# No gaps detected\n")
-    sys.exit(0)
-
-# Identificar centros de gap (agrupar regiones contiguas)
-gap_centers = []
-current_gap = [gap_regions[0]]
-for i in range(1, len(gap_regions)):
-    if gap_regions[i] - gap_regions[i-1] < spacing:
-        current_gap.append(gap_regions[i])
-    else:
-        gap_centers.append(np.mean(current_gap))
-        current_gap = [gap_regions[i]]
-gap_centers.append(np.mean(current_gap))
-
-# Buscar frames más cercanos en summary_distances para cada gap center
-dist_data = np.loadtxt(dist_file)
-frames_all = dist_data[:, 0].astype(int)
-dists_all = dist_data[:, 1]
-
-fill_windows = []
-for gc in gap_centers:
-    idx = np.argmin(np.abs(dists_all - gc))
-    fill_windows.append((frames_all[idx], dists_all[idx], gc))
-
-with open(gap_file, 'w') as f:
-    f.write("# Gap-filling windows\n")
-    f.write("# frame  actual_dist  gap_center\n")
-    for fw, ad, gc in fill_windows:
-        f.write(f"{fw} {ad:.4f} {gc:.4f}\n")
-
-print(f"  ⚠ Se detectaron {len(gap_centers)} gaps en los histogramas")
-for gc in gap_centers:
-    print(f"    Gap en ξ ≈ {gc:.3f} nm")
-print(f"  → Ventanas sugeridas guardadas en gap_windows.dat")
-PYEOF
+    python3 "$SCRIPT_DIR/detect_gaps.py" histogram.xvg "$WINDOW_SPACING" \
+        "$RUNDIR/04_frames/summary_distances.dat" "$RUNDIR/gap_windows.dat"
 
     # Si hay gaps, preguntar si agregar ventanas
     if [ -f "$RUNDIR/gap_windows.dat" ] && grep -q '^[0-9]' "$RUNDIR/gap_windows.dat"; then
@@ -1335,13 +1112,124 @@ run_gap_fill_windows() {
 }
 
 #==========================================
+# VALIDACIÓN DE OVERLAP
+#==========================================
+validate_overlap() {
+    local STAGE="15b_overlap"
+    is_stage_done "$STAGE" && { log_info "Saltando: $STAGE"; return; }
+    log_step "Etapa 15b: Validación cuantitativa de overlap"
+    cd "$RUNDIR/07_analysis" || exit 1
+
+    [ ! -f histogram.xvg ] && { log_warning "histogram.xvg no encontrado"; mark_stage_done "$STAGE"; return; }
+
+    python3 "$SCRIPT_DIR/validate_overlap.py" histogram.xvg "$RUNDIR/07_analysis"
+
+    log_success "Reporte en: overlap_report.dat"
+    mark_stage_done "$STAGE"
+}
+
+#==========================================
+# LIMPIEZA DE TEMPORALES
+#==========================================
+cleanup_intermediates() {
+    local target_dir="${1:-$RUNDIR}"
+    log_step "Limpieza de archivos temporales"
+
+    if [ ! -d "$target_dir" ]; then
+        log_error "Directorio no encontrado: $target_dir"; return 1
+    fi
+
+    # Calcular espacio ocupado antes
+    local size_before
+    size_before=$(du -sh "$target_dir" 2>/dev/null | cut -f1)
+    log_info "Tamaño actual: $size_before"
+
+    # Contar archivos temporales
+    local n_conf n_dist n_nojump n_backup
+    n_conf=$(find "$target_dir/04_frames" -name 'conf*.gro' 2>/dev/null | wc -l)
+    n_dist=$(find "$target_dir/04_frames" -name 'dist*.xvg' 2>/dev/null | wc -l)
+    n_nojump=$(find "$target_dir/03_pulling" -name 'pull_nojump.xtc' 2>/dev/null | wc -l)
+    n_backup=$(find "$target_dir" -name '*.mdp.original' 2>/dev/null | wc -l)
+
+    echo -e "\n  ${CYAN}Archivos temporales encontrados:${NC}"
+    echo "    conf*.gro (frames extraídos):  $n_conf archivos"
+    echo "    dist*.xvg (distancias temp):   $n_dist archivos"
+    echo "    pull_nojump.xtc (PBC inter):   $n_nojump archivos"
+    echo "    *.mdp.original (backups MDP):  $n_backup archivos"
+    echo ""
+
+    local total=$((n_conf + n_dist + n_nojump))
+    if [ "$total" -eq 0 ]; then
+        log_info "No hay archivos temporales para limpiar"
+        return 0
+    fi
+
+    echo -e "  ${CYAN}Opciones de limpieza:${NC}"
+    echo "    1) Comprimir frames (conf*.gro → frames.tar.gz)"  
+    echo "    2) Eliminar frames y temporales (conservar summary_distances.dat)"
+    echo "    3) Eliminar todo lo temporal + comprimir logs"
+    echo "    0) Cancelar"
+    echo -e "  ${YELLOW}Seleccione [0-3] (default: 1):${NC}"
+    read -r CLEAN_MODE
+    CLEAN_MODE=${CLEAN_MODE:-1}
+
+    case $CLEAN_MODE in
+        1)
+            log_info "Comprimiendo frames..."
+            if [ "$n_conf" -gt 0 ]; then
+                tar -czf "$target_dir/04_frames/frames_backup.tar.gz" \
+                    -C "$target_dir/04_frames" $(cd "$target_dir/04_frames" && ls conf*.gro 2>/dev/null) \
+                    2>/dev/null && {
+                    rm -f "$target_dir/04_frames"/conf*.gro
+                    log_success "Frames comprimidos → frames_backup.tar.gz"
+                }
+            fi
+            rm -f "$target_dir/04_frames"/dist*.xvg 2>/dev/null
+            rm -f "$target_dir/03_pulling/pull_nojump.xtc" 2>/dev/null
+            ;;
+        2)
+            log_info "Eliminando archivos temporales..."
+            rm -f "$target_dir/04_frames"/conf*.gro 2>/dev/null
+            rm -f "$target_dir/04_frames"/dist*.xvg 2>/dev/null
+            rm -f "$target_dir/03_pulling/pull_nojump.xtc" 2>/dev/null
+            log_success "Temporales eliminados"
+            ;;
+        3)
+            log_info "Limpieza profunda..."
+            rm -f "$target_dir/04_frames"/conf*.gro 2>/dev/null
+            rm -f "$target_dir/04_frames"/dist*.xvg 2>/dev/null
+            rm -f "$target_dir/03_pulling/pull_nojump.xtc" 2>/dev/null
+            # Comprimir logs
+            if [ -d "$target_dir/logs" ]; then
+                tar -czf "$target_dir/logs_backup.tar.gz" \
+                    -C "$target_dir" logs/ 2>/dev/null && {
+                    rm -rf "$target_dir/logs"
+                    log_success "Logs comprimidos → logs_backup.tar.gz"
+                }
+            fi
+            # Comprimir trayectorias de umbrella (guardar solo .tpr y pullf/pullx)
+            for xtc in "$target_dir/06_umbrella_prod"/umbrella*.xtc; do
+                [ -f "$xtc" ] && rm -f "$xtc"
+            done
+            log_success "Limpieza profunda completada"
+            ;;
+        0) log_info "Limpieza cancelada"; return 0 ;;
+        *) log_warning "Opción inválida"; return 0 ;;
+    esac
+
+    local size_after
+    size_after=$(du -sh "$target_dir" 2>/dev/null | cut -f1)
+    echo -e "\n  ${GREEN}Espacio: $size_before → $size_after${NC}"
+}
+
+#==========================================
 # RESUMEN FINAL
 #==========================================
 generate_summary() {
     log_step "Generando resumen"
     cat > "$RUNDIR/RESUMEN.txt" <<SUMMARY
 ═══════════════════════════════════════
-  UMBRELLA SAMPLING v2 — RESUMEN
+  UMBRELLA SAMPLING v3 — RESUMEN
   $(date)
 ═══════════════════════════════════════
 
@@ -1373,6 +1261,21 @@ SUMMARY
 main() {
     [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] && show_help
 
+    # Verificar que scripts/ existe
+    if [ ! -d "$SCRIPT_DIR" ]; then
+        log_error "Carpeta scripts/ no encontrada en: $SCRIPT_DIR"
+        log_info "Asegúrate de que la carpeta scripts/ está junto a umbrella_pipeline.sh"
+        exit 1
+    fi
+
+    # Modo --cleanup
+    if [ "${1:-}" = "--cleanup" ]; then
+        [ -z "${2:-}" ] || [ ! -d "${2:-}" ] && { log_error "Directorio inválido"; exit 1; }
+        cleanup_intermediates "$(realpath "$2")"
+        trap - EXIT
+        exit 0
+    fi
+
     if [ "${1:-}" = "--resume" ]; then
         [ -z "${2:-}" ] || [ ! -d "${2:-}" ] && { log_error "Directorio inválido"; exit 1; }
         RUNDIR="$(realpath "$2")"
@@ -1383,7 +1286,7 @@ main() {
             INPUT_PDB="$INITIAL_DIR/$INPUT_PDB"
             PULL_NSTEPS=$(echo "$PULL_TIME / 0.002" | bc)
             UMBRELLA_NSTEPS=$(echo "$UMBRELLA_NS * 500000" | bc)
-            # Defaults para variables v2
+            # Defaults para variables v3
             PULL_GROUP1_NAME=${PULL_GROUP1_NAME:-Chain_A}
             PULL_GROUP2_NAME=${PULL_GROUP2_NAME:-Chain_B}
             SYSTEM_MODE=${SYSTEM_MODE:-multichain}
@@ -1407,29 +1310,40 @@ main() {
     run_npt_equilibration
     create_pull_groups
     run_pulling
-    correct_pbc                    # NUEVO: corrección PBC
+    correct_pbc                    # Corrección PBC
     extract_frames_and_distances
-    estimate_jarzynski             # NUEVO: Jarzynski ΔG
-    select_windows                 # MEJORADO: selección adaptativa
+    estimate_jarzynski             # Jarzynski ΔG
+    select_windows                 # Selección adaptativa
     run_umbrella_npt
     run_umbrella_production
     run_wham_analysis
-    analyze_convergence            # NUEVO: convergencia
-    detect_histogram_gaps          # NUEVO: detección + auto-fill
+    analyze_convergence            # Convergencia
+    validate_overlap               # NUEVO: validación de overlap
+    detect_histogram_gaps          # Detección + auto-fill
     generate_summary
 
     echo ""
     echo -e "${GREEN}═══════════════════════════════════════════${NC}"
-    echo -e "${GREEN}  ✓ UMBRELLA SAMPLING v2 COMPLETADO${NC}"
+    echo -e "${GREEN}  ✓ UMBRELLA SAMPLING v3 COMPLETADO${NC}"
     echo -e "${GREEN}═══════════════════════════════════════════${NC}"
     echo ""
     echo -e "  PMF:          ${CYAN}$RUNDIR/07_analysis/pmf.xvg${NC}"
     echo -e "  Histogramas:  ${CYAN}$RUNDIR/07_analysis/histogram.xvg${NC}"
+    echo -e "  Overlap:      ${CYAN}$RUNDIR/07_analysis/overlap_report.dat${NC}"
     echo -e "  Convergencia: ${CYAN}$RUNDIR/07_analysis/convergence_report.dat${NC}"
     echo -e "  Jarzynski:    ${CYAN}$RUNDIR/07_analysis/jarzynski.dat${NC}"
     echo ""
     echo -e "  Graficar: ${YELLOW}python3 plot_umbrella.py $RUNDIR/07_analysis/${NC}"
+    echo -e "  Limpiar:  ${YELLOW}$0 --cleanup $RUNDIR${NC}"
     echo ""
+
+    # Ofrecer limpieza
+    echo -e "  ${YELLOW}¿Limpiar archivos temporales ahora? (s/n) [n]:${NC}"
+    read -r DO_CLEANUP
+    if [[ "${DO_CLEANUP,,}" == "s" ]]; then
+        cleanup_intermediates "$RUNDIR"
+    fi
+
     trap - EXIT
 }
 
