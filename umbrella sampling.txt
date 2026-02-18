@@ -1,0 +1,229 @@
+Prepare the Topology
+Run the structure through pdb2gmx:
+gmx pdb2gmx -f 2BEG_model1_capped.pdb -ignh -ter -o complex.gro
+13
+1
+2
+0
+Repeat  2 and 0 for each chain 
+
+Modify topol_Protein_chain_B.itp (at the end of the file):
+Add these lines at end (Don’t replace but add new lines) 
+#ifdef POSRES_B
+#include "posre_Protein_chain_B.itp"
+#endif
+
+We will be using chain B as an immobile reference
+
+Step Two: Define the Unit Cell
+The unit cell (simulation box) must be carefully defined to ensure correct distance calculations. 
+
+Make sure the pulling distance is less than half the box size in that direction.
+So if you want to pull the molecule by 5.0 nm, your box must be at least 10.0 nm in that direction.
+In the tutorial, they use a 12.0-nm box in z, which is safe.
+
+The coordinates (3.280, 2.181, 2.4775) and box dimensions 6.560 × 4.362 × 12.000 nm are manually chosen — they don't come from the PDB file.
+
+gmx editconf -f complex.gro -o newbox.gro -center 3.280 2.181 2.4775 -box 6.560 4.362 12
+
+Step Three: Adding Solvent and Ions
+First, we will add water with solvate:
+gmx solvate -cp newbox.gro -cs spc216.gro -o solv.gro -p topol.top
+
+Generate ions.mdp
+gmx grompp -f ions.mdp -c solv.gro -p topol.top -o ions.tpr -maxwarn 1
+gmx genion -s ions.tpr -o solv_ions.gro -p topol.top -pname NA -nname CL -neutral -conc 0.1
+Select group 13 (SOL) to replace water molecules with ions.
+
+Step Four: Energy Minimization and Equilibration
+Generate minim.mdp
+gmx grompp -f minim.mdp -c solv_ions.gro -p topol.top -o em.tpr -maxwarn 1
+gmx mdrun -v -deffnm em
+
+Generate npt.mdp
+gmx grompp -f npt.mdp -c em.gro -p topol.top -r em.gro -o npt.tpr -maxwarn 3
+it is generating three warrnings so we used three at end 
+gmx mdrun -deffnm npt -v
+Step Five: Generating Configurations
+Peptide A Dissociation 
+You want to measure how much energy it takes to pull peptide A away from the rest of the protofibril (especially from chain B). This helps build a free energy profile (PMF) along a reaction coordinate—here, the z-direction.
+
+gmx make_ndx -f npt.gro
+r 1-27
+ name 17 Chain_A
+ r 28-54
+ name 18 Chain_B
+q
+
+Run the pulling simulation:
+Generate md_pull.mdp
+gmx grompp -f md_pull.mdp -c npt.gro -p topol.top -r npt.gro -n index.ndx -t npt.cpt -o pull.tpr -maxwarn 2
+gmx mdrun -deffnm pull -pf pullf.xvg -px pullx.xvg -v
+xmgrace pullf.xvg
+
+Extract Frames from the Pulling Trajectory
+gmx trjconv -s pull.tpr -f pull.xtc -o conf.gro -sep
+save the whole system, group 0, when prompted
+
+Measure Distance Between Chains
+
+Common Mistake:
+If you created the script in Windows and copied it to Ubuntu, sometimes the line endings are wrong.
+So always use following procedure 
+since you have hundreds of frames, you need to automate this.
+
+Create a script file:
+nano get_distances.sh
+then press Ctrl+O, Enter, then Ctrl+X to save and exit.
+Make it executable
+chmod +x get_distances.sh
+Run the script
+./get_distances.sh
+
+xmgrace summary_distances.dat
+
+Step Six: Umbrella Sampling Simulations
+frame number increments by 20 each time starting from 6.
+gmx grompp -f npt_umbrella.mdp -c conf6.gro   -p topol.top -r conf6.gro   -n index.ndx -o npt0.tpr -maxwarn 3
+gmx mdrun -deffnm npt0 -v
+gmx grompp -f npt_umbrella.mdp -c conf26.gro  -p topol.top -r conf26.gro  -n index.ndx -o npt1.tpr -maxwarn 3
+gmx mdrun -deffnm npt1 -v
+gmx grompp -f npt_umbrella.mdp -c conf46.gro  -p topol.top -r conf46.gro  -n index.ndx -o npt2.tpr -maxwarn 3
+gmx mdrun -deffnm npt2 -v
+gmx grompp -f npt_umbrella.mdp -c conf66.gro  -p topol.top -r conf66.gro  -n index.ndx -o npt3.tpr -maxwarn 3
+gmx mdrun -deffnm npt3 -v
+gmx grompp -f npt_umbrella.mdp -c conf86.gro  -p topol.top -r conf86.gro  -n index.ndx -o npt4.tpr -maxwarn 3
+gmx mdrun -deffnm npt4 -v
+gmx grompp -f npt_umbrella.mdp -c conf106.gro -p topol.top -r conf106.gro -n index.ndx -o npt5.tpr -maxwarn 3
+gmx mdrun -deffnm npt5 -v
+gmx grompp -f npt_umbrella.mdp -c conf126.gro -p topol.top -r conf126.gro -n index.ndx -o npt6.tpr -maxwarn 3
+gmx mdrun -deffnm npt6 -v
+gmx grompp -f npt_umbrella.mdp -c conf146.gro -p topol.top -r conf146.gro -n index.ndx -o npt7.tpr -maxwarn 3
+gmx mdrun -deffnm npt7 -v
+gmx grompp -f npt_umbrella.mdp -c conf166.gro -p topol.top -r conf166.gro -n index.ndx -o npt8.tpr -maxwarn 3
+gmx mdrun -deffnm npt8 -v
+gmx grompp -f npt_umbrella.mdp -c conf186.gro -p topol.top -r conf186.gro -n index.ndx -o npt9.tpr -maxwarn 3
+gmx mdrun -deffnm npt9 -v
+gmx grompp -f npt_umbrella.mdp -c conf206.gro -p topol.top -r conf206.gro -n index.ndx -o npt10.tpr -maxwarn 3
+gmx mdrun -deffnm npt10 -v
+gmx grompp -f npt_umbrella.mdp -c conf226.gro -p topol.top -r conf226.gro -n index.ndx -o npt11.tpr -maxwarn 3
+gmx mdrun -deffnm npt11 -v
+gmx grompp -f npt_umbrella.mdp -c conf246.gro -p topol.top -r conf246.gro -n index.ndx -o npt12.tpr -maxwarn 3
+gmx mdrun -deffnm npt12 -v
+gmx grompp -f npt_umbrella.mdp -c conf266.gro -p topol.top -r conf266.gro -n index.ndx -o npt13.tpr -maxwarn 3
+gmx mdrun -deffnm npt13 -v
+gmx grompp -f npt_umbrella.mdp -c conf286.gro -p topol.top -r conf286.gro -n index.ndx -o npt14.tpr -maxwarn 3
+gmx mdrun -deffnm npt14 -v
+gmx grompp -f npt_umbrella.mdp -c conf306.gro -p topol.top -r conf306.gro -n index.ndx -o npt15.tpr -maxwarn 3
+gmx mdrun -deffnm npt15 -v
+gmx grompp -f npt_umbrella.mdp -c conf326.gro -p topol.top -r conf326.gro -n index.ndx -o npt16.tpr -maxwarn 3
+gmx mdrun -deffnm npt16 -v
+gmx grompp -f npt_umbrella.mdp -c conf346.gro -p topol.top -r conf346.gro -n index.ndx -o npt17.tpr -maxwarn 3
+gmx mdrun -deffnm npt17 -v
+gmx grompp -f npt_umbrella.mdp -c conf366.gro -p topol.top -r conf366.gro -n index.ndx -o npt18.tpr -maxwarn 3
+gmx mdrun -deffnm npt18 -v
+gmx grompp -f npt_umbrella.mdp -c conf386.gro -p topol.top -r conf386.gro -n index.ndx -o npt19.tpr -maxwarn 3
+gmx mdrun -deffnm npt19 -v
+gmx grompp -f npt_umbrella.mdp -c conf406.gro -p topol.top -r conf406.gro -n index.ndx -o npt20.tpr -maxwarn 3
+gmx mdrun -deffnm npt20 -v
+gmx grompp -f npt_umbrella.mdp -c conf426.gro -p topol.top -r conf426.gro -n index.ndx -o npt21.tpr -maxwarn 3
+gmx mdrun -deffnm npt21 -v
+gmx grompp -f npt_umbrella.mdp -c conf446.gro -p topol.top -r conf446.gro -n index.ndx -o npt22.tpr -maxwarn 3
+gmx mdrun -deffnm npt22 -v
+
+
+Final Production Step (0.1ns)
+Generate md_umbrella.mdp
+
+gmx grompp -f md_umbrella.mdp -c npt0.gro -t npt0.cpt -p topol.top -r npt0.gro -n index.ndx -o umbrella0.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella0 -v
+gmx grompp -f md_umbrella.mdp -c npt1.gro -t npt1.cpt -p topol.top -r npt1.gro -n index.ndx -o umbrella1.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella1 -v
+gmx grompp -f md_umbrella.mdp -c npt2.gro -t npt2.cpt -p topol.top -r npt2.gro -n index.ndx -o umbrella2.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella2 -v
+gmx grompp -f md_umbrella.mdp -c npt3.gro -t npt3.cpt -p topol.top -r npt3.gro -n index.ndx -o umbrella3.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella3 -v
+gmx grompp -f md_umbrella.mdp -c npt4.gro -t npt4.cpt -p topol.top -r npt4.gro -n index.ndx -o umbrella4.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella4 -v
+gmx grompp -f md_umbrella.mdp -c npt5.gro -t npt5.cpt -p topol.top -r npt5.gro -n index.ndx -o umbrella5.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella5 -v
+gmx grompp -f md_umbrella.mdp -c npt6.gro -t npt6.cpt -p topol.top -r npt6.gro -n index.ndx -o umbrella6.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella6 -v
+gmx grompp -f md_umbrella.mdp -c npt7.gro -t npt7.cpt -p topol.top -r npt7.gro -n index.ndx -o umbrella7.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella7 -v
+gmx grompp -f md_umbrella.mdp -c npt8.gro -t npt8.cpt -p topol.top -r npt8.gro -n index.ndx -o umbrella8.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella8 -v
+gmx grompp -f md_umbrella.mdp -c npt9.gro -t npt9.cpt -p topol.top -r npt9.gro -n index.ndx -o umbrella9.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella9 -v
+gmx grompp -f md_umbrella.mdp -c npt10.gro -t npt10.cpt -p topol.top -r npt10.gro -n index.ndx -o umbrella10.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella10 -v
+gmx grompp -f md_umbrella.mdp -c npt11.gro -t npt11.cpt -p topol.top -r npt11.gro -n index.ndx -o umbrella11.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella11 -v
+gmx grompp -f md_umbrella.mdp -c npt12.gro -t npt12.cpt -p topol.top -r npt12.gro -n index.ndx -o umbrella12.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella12 -v
+gmx grompp -f md_umbrella.mdp -c npt13.gro -t npt13.cpt -p topol.top -r npt13.gro -n index.ndx -o umbrella13.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella13 -v
+gmx grompp -f md_umbrella.mdp -c npt14.gro -t npt14.cpt -p topol.top -r npt14.gro -n index.ndx -o umbrella14.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella14 -v
+gmx grompp -f md_umbrella.mdp -c npt15.gro -t npt15.cpt -p topol.top -r npt15.gro -n index.ndx -o umbrella15.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella15 -v
+gmx grompp -f md_umbrella.mdp -c npt16.gro -t npt16.cpt -p topol.top -r npt16.gro -n index.ndx -o umbrella16.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella16 -v
+gmx grompp -f md_umbrella.mdp -c npt17.gro -t npt17.cpt -p topol.top -r npt17.gro -n index.ndx -o umbrella17.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella17 -v
+gmx grompp -f md_umbrella.mdp -c npt18.gro -t npt18.cpt -p topol.top -r npt18.gro -n index.ndx -o umbrella18.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella18 -v
+gmx grompp -f md_umbrella.mdp -c npt19.gro -t npt19.cpt -p topol.top -r npt19.gro -n index.ndx -o umbrella19.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella19 -v
+gmx grompp -f md_umbrella.mdp -c npt20.gro -t npt20.cpt -p topol.top -r npt20.gro -n index.ndx -o umbrella20.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella20 -v
+gmx grompp -f md_umbrella.mdp -c npt21.gro -t npt21.cpt -p topol.top -r npt21.gro -n index.ndx -o umbrella21.tpr -maxwarn 2
+gmx mdrun -deffnm umbrella21 -v
+ 
+Step Seven: Data Analysis
+# Generate the list of .tpr files
+ls umbrella*.tpr | sort -V > tpr-files.dat
+
+# Generate the list of pull force files
+ls umbrella*_pullf.xvg | sort -V > pullf-files.dat
+
+Now Run
+cat tpr-files.dat
+cat pullf-files.dat
+
+following files will be displayed
+maddy@T480:/mnt/c/Users/hibsa/Desktop/gmx$ cat tpr-files.dat
+umbrella0.tpr
+umbrella1.tpr
+umbrella2.tpr
+umbrella3.tpr
+umbrella4.tpr
+umbrella5.tpr
+umbrella6.tpr
+umbrella7.tpr
+umbrella8.tpr
+maddy@T480:/mnt/c/Users/hibsa/Desktop/gmx$ cat pullf-files.dat
+umbrella0_pullf.xvg
+umbrella1_pullf.xvg
+umbrella2_pullf.xvg
+umbrella3_pullf.xvg
+umbrella4_pullf.xvg
+umbrella5_pullf.xvg
+umbrella6_pullf.xvg
+umbrella7_pullf.xvg
+umbrella8_pullf.xvg
+
+Run WHAM Analysis
+gmx wham -it tpr-files.dat -if pullf-files.dat -o pmf.xvg -hist histogram.xvg -unit kCal
+
+Plot the PMF profile:
+xmgrace pmf.xvg
+
+xmgrace histogram.xvg
+
+How to Understand the Umbrella Sampling Results:
+When we use umbrella sampling, we are trying to find out how much energy it takes to separate two molecules (or move them along a specific reaction coordinate). The result of this is the Potential of Mean Force (PMF) curve, which tells us how favorable or unfavorable the interaction is at different distances.
+In our case:
+•	We calculated a ΔG of 46 kcal/mol → this is the total energy required to move the molecule from its bound state to the unbound state.
+•	A previous study calculated ΔG of 50.5 kcal/mol → very similar to our result, which means our method is generally reliable.
+
